@@ -10,29 +10,73 @@ use indicatif::{ProgressBar, ProgressStyle};
 use idevice::IdeviceService;
 use idevice::afc::opcode::AfcFopenMode;
 use idevice::afc::AfcClient;
+use idevice::house_arrest::HouseArrestClient;
 use idevice::lockdown::LockdownClient;
 use idevice::provider::{IdeviceProvider, UsbmuxdProvider};
 use idevice::usbmuxd::{UsbmuxdAddr, UsbmuxdConnection};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-/// Turbo file transfer to iPad over USB
+/// Fast file transfer and management for iPad over USB
 #[derive(Parser)]
 #[command(name = "ipad-push", about = "Fast file transfer to iPad via USB")]
 struct Args {
-    /// Local file to transfer
-    file: PathBuf,
+    #[command(subcommand)]
+    command: Command,
+}
 
-    /// Destination path on iPad (default: /Downloads/<filename>)
-    #[arg(short, long)]
-    dest: Option<String>,
-
-    /// Number of parallel streams (axel-style chunked transfer)
-    #[arg(short = 'n', long, default_value = "4")]
-    streams: usize,
-
-    /// Chunk size in MB for each write operation
-    #[arg(short, long, default_value = "8")]
-    chunk_mb: usize,
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Push a file to the iPad
+    Push {
+        /// Local file to transfer
+        file: PathBuf,
+        /// Destination path on iPad (default: /Downloads/<filename>)
+        #[arg(short, long)]
+        dest: Option<String>,
+        /// App bundle ID to push into (e.g. com.example.app)
+        #[arg(short, long)]
+        app: Option<String>,
+        /// Number of parallel streams (axel-style chunked transfer)
+        #[arg(short = 'n', long, default_value = "4")]
+        streams: usize,
+        /// Chunk size in MB for each write operation
+        #[arg(short, long, default_value = "8")]
+        chunk_mb: usize,
+    },
+    /// List files on the iPad
+    Ls {
+        /// Path to list (default: /)
+        #[arg(default_value = "/")]
+        path: String,
+        /// App bundle ID to browse (e.g. com.example.app)
+        #[arg(short, long)]
+        app: Option<String>,
+        /// Recursive listing
+        #[arg(short, long)]
+        recursive: bool,
+    },
+    /// Delete files on the iPad
+    Rm {
+        /// Paths to delete
+        paths: Vec<String>,
+        /// App bundle ID
+        #[arg(short, long)]
+        app: Option<String>,
+        /// Recursive delete
+        #[arg(short, long)]
+        recursive: bool,
+    },
+    /// Show device info and free space
+    Info,
+    /// Disk usage breakdown (ncdu-style)
+    Du {
+        /// Path to analyze (default: /)
+        #[arg(default_value = "/")]
+        path: String,
+        /// Max depth to display
+        #[arg(short, long, default_value = "2")]
+        depth: usize,
+    },
 }
 
 /// Connect to AFC service on the first USB device found
@@ -48,6 +92,30 @@ async fn connect_afc(provider: &UsbmuxdProvider) -> Result<AfcClient> {
     Ok(AfcClient::new(idevice))
 }
 
+/// Connect to AFC service scoped to an app's Documents directory
+async fn connect_afc_app(provider: &UsbmuxdProvider, bundle_id: &str) -> Result<AfcClient> {
+    let mut lockdown = LockdownClient::connect(provider).await?;
+    let pairing = provider.get_pairing_file().await?;
+    lockdown.start_session(&pairing).await?;
+    let (port, ssl) = lockdown.start_service("com.apple.mobile.house_arrest").await?;
+    let mut idevice = provider.connect(port).await?;
+    if ssl {
+        idevice.start_session(&pairing, false).await?;
+    }
+    let ha = HouseArrestClient::new(idevice);
+    let afc = ha.vend_documents(bundle_id).await
+        .with_context(|| format!("Failed to access app documents for {bundle_id}"))?;
+    Ok(afc)
+}
+
+/// Connect to AFC — either global or app-scoped
+async fn get_afc(provider: &UsbmuxdProvider, app: Option<&str>) -> Result<AfcClient> {
+    match app {
+        Some(bundle_id) => connect_afc_app(provider, bundle_id).await,
+        None => connect_afc(provider).await,
+    }
+}
+
 /// Ensure parent directories exist on device
 async fn ensure_dir(afc: &mut AfcClient, path: &str) -> Result<()> {
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
@@ -60,15 +128,16 @@ async fn ensure_dir(afc: &mut AfcClient, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Single-stream transfer
-async fn transfer_single(
+/// Single-stream transfer with optional app scope
+async fn transfer_single_app(
     provider: &UsbmuxdProvider,
+    app: Option<&str>,
     data: &[u8],
     dest: &str,
     chunk_size: usize,
     pb: &ProgressBar,
 ) -> Result<()> {
-    let mut afc = connect_afc(provider).await?;
+    let mut afc = get_afc(provider, app).await?;
     ensure_dir(&mut afc, dest).await?;
 
     let mut file = afc.open(dest, AfcFopenMode::WrOnly).await?;
@@ -172,26 +241,7 @@ async fn transfer_parallel(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-
-    let data = std::fs::read(&args.file)
-        .with_context(|| format!("Failed to read {}", args.file.display()))?;
-    let file_size = data.len() as u64;
-    let filename = args
-        .file
-        .file_name()
-        .context("No filename")?
-        .to_string_lossy();
-
-    let dest = args
-        .dest
-        .unwrap_or_else(|| format!("/Downloads/{}", filename));
-
-    let chunk_size = args.chunk_mb * 1024 * 1024;
-
-    // Find device
+async fn get_provider() -> Result<UsbmuxdProvider> {
     let addr = UsbmuxdAddr::default();
     let mut conn = UsbmuxdConnection::default().await
         .context("Cannot connect to usbmuxd. Is the iPad plugged in?")?;
@@ -200,16 +250,264 @@ async fn main() -> Result<()> {
         .into_iter()
         .find(|d| d.connection_type == idevice::usbmuxd::Connection::Usb)
         .context("No USB device found. Is the iPad plugged in and trusted?")?;
+    Ok(device.to_provider(addr, "ipad-push"))
+}
 
-    let provider = device.to_provider(addr, "ipad-push");
+fn format_size(bytes: usize) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
 
-    // Show device info
+async fn cmd_ls(provider: &UsbmuxdProvider, path: &str, app: Option<&str>, recursive: bool) -> Result<()> {
+    let mut afc = get_afc(provider, app).await?;
+    ls_inner(&mut afc, path, recursive, 0).await
+}
+
+#[async_recursion::async_recursion]
+async fn ls_inner(afc: &mut AfcClient, path: &str, recursive: bool, depth: usize) -> Result<()> {
+    let entries = afc.list_dir(path).await?;
+    for entry in &entries {
+        if entry == "." || entry == ".." {
+            continue;
+        }
+        let full_path = if path == "/" {
+            format!("/{entry}")
+        } else {
+            format!("{path}/{entry}")
+        };
+        match afc.get_file_info(&full_path).await {
+            Ok(info) => {
+                let indent = "  ".repeat(depth);
+                if info.st_ifmt == "S_IFDIR" {
+                    println!("{indent}{entry}/");
+                    if recursive {
+                        ls_inner(afc, &full_path, true, depth + 1).await?;
+                    }
+                } else {
+                    println!("{indent}{entry}  ({})", format_size(info.size));
+                }
+            }
+            Err(_) => {
+                let indent = "  ".repeat(depth);
+                println!("{indent}{entry}  [error reading info]");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_rm(provider: &UsbmuxdProvider, paths: &[String], app: Option<&str>, recursive: bool) -> Result<()> {
+    let mut afc = get_afc(provider, app).await?;
+    for path in paths {
+        if recursive {
+            afc.remove_all(path).await
+                .with_context(|| format!("Failed to remove {path}"))?;
+        } else {
+            afc.remove(path).await
+                .with_context(|| format!("Failed to remove {path}"))?;
+        }
+        eprintln!("Deleted: {path}");
+    }
+    Ok(())
+}
+
+async fn cmd_info(provider: &UsbmuxdProvider) -> Result<()> {
+    let mut afc = connect_afc(provider).await?;
+    let info = afc.get_device_info().await?;
+    println!("Model:      {}", info.model);
+    println!("Total:      {}", format_size(info.total_bytes));
+    println!("Free:       {}", format_size(info.free_bytes));
+    println!("Block size: {}", format_size(info.block_size));
+    Ok(())
+}
+
+struct DuEntry {
+    path: String,
+    size: u64,
+}
+
+#[async_recursion::async_recursion]
+async fn du_walk(afc: &mut AfcClient, path: &str) -> Result<u64> {
+    let entries = match afc.list_dir(path).await {
+        Ok(e) => e,
+        Err(_) => return Ok(0),
+    };
+    let mut total: u64 = 0;
+    for entry in &entries {
+        if entry == "." || entry == ".." {
+            continue;
+        }
+        let full_path = if path == "/" {
+            format!("/{entry}")
+        } else {
+            format!("{path}/{entry}")
+        };
+        match afc.get_file_info(&full_path).await {
+            Ok(info) => {
+                if info.st_ifmt == "S_IFDIR" {
+                    total += du_walk(afc, &full_path).await?;
+                } else {
+                    total += info.size as u64;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(total)
+}
+
+async fn cmd_du(provider: &UsbmuxdProvider, path: &str, max_depth: usize) -> Result<()> {
+    let mut afc = connect_afc(provider).await?;
+    let info = afc.get_device_info().await?;
+    let total_bytes = info.total_bytes as u64;
+    let free_bytes = info.free_bytes as u64;
+    let used_bytes = total_bytes - free_bytes;
+
+    eprintln!("Scanning {}...", path);
+
+    let entries = afc.list_dir(path).await?;
+    let mut results: Vec<DuEntry> = Vec::new();
+
+    for entry in &entries {
+        if entry == "." || entry == ".." {
+            continue;
+        }
+        let full_path = if path == "/" {
+            format!("/{entry}")
+        } else {
+            format!("{path}/{entry}")
+        };
+        match afc.get_file_info(&full_path).await {
+            Ok(info) => {
+                let size = if info.st_ifmt == "S_IFDIR" {
+                    du_walk(&mut afc, &full_path).await?
+                } else {
+                    info.size as u64
+                };
+                results.push(DuEntry { path: full_path, size });
+            }
+            Err(_) => {}
+        }
+    }
+
+    results.sort_by(|a, b| b.size.cmp(&a.size));
+
+    // Print header
+    println!("{:>10}  {:<6}  {}", "SIZE", "%USED", "PATH");
+    println!("{:>10}  {:<6}  {}", "----", "-----", "----");
+
+    for entry in &results {
+        let pct = if used_bytes > 0 {
+            (entry.size as f64 / used_bytes as f64) * 100.0
+        } else {
+            0.0
+        };
+        let bar_width = 20;
+        let filled = ((pct / 100.0) * bar_width as f64) as usize;
+        let bar: String = "#".repeat(filled) + &"-".repeat(bar_width - filled);
+        println!(
+            "{:>10}  {:>5.1}%  [{}] {}",
+            format_size(entry.size as usize),
+            pct,
+            bar,
+            entry.path,
+        );
+    }
+
+    println!();
+    println!("Total used: {} / {} ({:.1}% full, {} free)",
+        format_size(used_bytes as usize),
+        format_size(total_bytes as usize),
+        (used_bytes as f64 / total_bytes as f64) * 100.0,
+        format_size(free_bytes as usize),
+    );
+
+    // Recurse into top dirs if depth > 1
+    if max_depth > 1 {
+        for entry in &results {
+            if entry.size == 0 {
+                continue;
+            }
+            // Check if it's a dir
+            if let Ok(info) = afc.get_file_info(&entry.path).await {
+                if info.st_ifmt == "S_IFDIR" {
+                    println!("\n--- {} ({}) ---", entry.path, format_size(entry.size as usize));
+                    let sub_entries = match afc.list_dir(&entry.path).await {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+                    let mut sub_results: Vec<DuEntry> = Vec::new();
+                    for sub in &sub_entries {
+                        if sub == "." || sub == ".." {
+                            continue;
+                        }
+                        let sub_path = format!("{}/{sub}", entry.path);
+                        match afc.get_file_info(&sub_path).await {
+                            Ok(si) => {
+                                let size = if si.st_ifmt == "S_IFDIR" {
+                                    du_walk(&mut afc, &sub_path).await?
+                                } else {
+                                    si.size as u64
+                                };
+                                if size > 0 {
+                                    sub_results.push(DuEntry { path: sub_path, size });
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    sub_results.sort_by(|a, b| b.size.cmp(&a.size));
+                    for sub in &sub_results {
+                        println!("  {:>10}  {}", format_size(sub.size as usize), sub.path);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_push(
+    provider: &UsbmuxdProvider,
+    file: &PathBuf,
+    dest: Option<&String>,
+    app: Option<&str>,
+    streams: usize,
+    chunk_mb: usize,
+) -> Result<()> {
+    let data = std::fs::read(file)
+        .with_context(|| format!("Failed to read {}", file.display()))?;
+    let file_size = data.len() as u64;
+    let filename = file.file_name().context("No filename")?.to_string_lossy();
+
+    let dest = match dest {
+        Some(d) => d.clone(),
+        None if app.is_some() => format!("/{}", filename),
+        None => format!("/Downloads/{}", filename),
+    };
+
+    let chunk_size = chunk_mb * 1024 * 1024;
+
     {
-        let mut afc = connect_afc(&provider).await?;
+        // Space check uses global AFC (app-scoped doesn't support get_device_info)
+        let mut afc = connect_afc(provider).await?;
         let info = afc.get_device_info().await?;
+        let target = if let Some(a) = app {
+            format!("{} ({})", info.model, a)
+        } else {
+            info.model.clone()
+        };
         eprintln!(
             "Device: {} | Free: {:.1} GB",
-            info.model,
+            target,
             info.free_bytes as f64 / 1_073_741_824.0
         );
         if file_size > info.free_bytes as u64 {
@@ -234,16 +532,17 @@ async fn main() -> Result<()> {
         filename,
         file_size as f64 / 1_048_576.0,
         dest,
-        args.streams,
-        args.chunk_mb,
+        streams,
+        chunk_mb,
     );
 
     let start = Instant::now();
 
-    if args.streams <= 1 {
-        transfer_single(&provider, &data, &dest, chunk_size, &pb).await?;
+    // For app-scoped transfers, use single stream (each house_arrest connection is separate)
+    if app.is_some() || streams <= 1 {
+        transfer_single_app(provider, app, &data, &dest, chunk_size, &pb).await?;
     } else {
-        transfer_parallel(&provider, &data, &dest, args.streams, chunk_size, &pb).await?;
+        transfer_parallel(provider, &data, &dest, streams, chunk_size, &pb).await?;
     }
 
     pb.finish_and_clear();
@@ -257,4 +556,28 @@ async fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    let provider = get_provider().await?;
+
+    match &args.command {
+        Command::Push { file, dest, app, streams, chunk_mb } => {
+            cmd_push(&provider, file, dest.as_ref(), app.as_deref(), *streams, *chunk_mb).await
+        }
+        Command::Ls { path, app, recursive } => {
+            cmd_ls(&provider, path, app.as_deref(), *recursive).await
+        }
+        Command::Rm { paths, app, recursive } => {
+            cmd_rm(&provider, paths, app.as_deref(), *recursive).await
+        }
+        Command::Info => {
+            cmd_info(&provider).await
+        }
+        Command::Du { path, depth } => {
+            cmd_du(&provider, path, *depth).await
+        }
+    }
 }
