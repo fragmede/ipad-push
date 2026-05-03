@@ -2,6 +2,7 @@
 name = "ipad-push"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-only"
 
 [dependencies]
 idevice = { version = "0.1.58", features = ["usbmuxd", "afc", "house_arrest", "installation_proxy"] }
