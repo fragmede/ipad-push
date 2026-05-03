@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-idevice = { version = "0.1.58", features = ["usbmuxd", "afc", "house_arrest"] }
+idevice = { version = "0.1.58", features = ["usbmuxd", "afc", "house_arrest", "installation_proxy"] }
 tokio = { version = "1", features = ["full"] }
 indicatif = "0.17"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+plist = "1"
 async-recursion = "1"

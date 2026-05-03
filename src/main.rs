@@ -11,6 +11,7 @@ use idevice::IdeviceService;
 use idevice::afc::opcode::AfcFopenMode;
 use idevice::afc::AfcClient;
 use idevice::house_arrest::HouseArrestClient;
+use idevice::installation_proxy::InstallationProxyClient;
 use idevice::lockdown::LockdownClient;
 use idevice::provider::{IdeviceProvider, UsbmuxdProvider};
 use idevice::usbmuxd::{UsbmuxdAddr, UsbmuxdConnection};
@@ -68,6 +69,15 @@ enum Command {
     },
     /// Show device info and free space
     Info,
+    /// List installed apps
+    Apps {
+        /// Filter: "User", "System", or "Any"
+        #[arg(short, long, default_value = "User")]
+        filter: String,
+        /// Search for apps matching a string
+        #[arg(short, long)]
+        search: Option<String>,
+    },
     /// Disk usage breakdown (ncdu-style)
     Du {
         /// Path to analyze (default: /)
@@ -318,6 +328,71 @@ async fn cmd_rm(provider: &UsbmuxdProvider, paths: &[String], app: Option<&str>,
     Ok(())
 }
 
+async fn cmd_apps(provider: &UsbmuxdProvider, filter: &str, search: Option<&str>) -> Result<()> {
+    let mut lockdown = LockdownClient::connect(provider).await?;
+    let pairing = provider.get_pairing_file().await?;
+    lockdown.start_session(&pairing).await?;
+    let (port, ssl) = lockdown.start_service("com.apple.mobile.installation_proxy").await?;
+    let mut idevice = provider.connect(port).await?;
+    if ssl {
+        idevice.start_session(&pairing, false).await?;
+    }
+    let mut client = InstallationProxyClient::new(idevice);
+    let apps = client.get_apps(Some(filter), None).await?;
+
+    let mut entries: Vec<(String, String)> = apps
+        .iter()
+        .filter_map(|(bundle_id, info)| {
+            let name = info
+                .as_dictionary()
+                .and_then(|d| d.get("CFBundleDisplayName").or(d.get("CFBundleName")))
+                .and_then(|v| v.as_string())
+                .unwrap_or("?")
+                .to_string();
+            if let Some(q) = search {
+                let q_lower = q.to_lowercase();
+                if !name.to_lowercase().contains(&q_lower)
+                    && !bundle_id.to_lowercase().contains(&q_lower)
+                {
+                    return None;
+                }
+            }
+            Some((name, bundle_id.clone()))
+        })
+        .collect();
+
+    entries.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+
+    for (name, bundle_id) in &entries {
+        // Show file sharing status if searching
+        if search.is_some() {
+            if let Some(info) = apps.get(bundle_id).and_then(|v| v.as_dictionary()) {
+                let sharing = info
+                    .get("UIFileSharingEnabled")
+                    .and_then(|v| v.as_boolean())
+                    .unwrap_or(false);
+                let doc_browser = info
+                    .get("UISupportsDocumentBrowser")
+                    .and_then(|v| v.as_boolean())
+                    .unwrap_or(false);
+                let flags = match (sharing, doc_browser) {
+                    (true, true) => " [file-sharing, doc-browser]",
+                    (true, false) => " [file-sharing]",
+                    (false, true) => " [doc-browser]",
+                    (false, false) => "",
+                };
+                println!("{:<30} {}{}", name, bundle_id, flags);
+            } else {
+                println!("{:<30} {}", name, bundle_id);
+            }
+        } else {
+            println!("{:<30} {}", name, bundle_id);
+        }
+    }
+    eprintln!("\n{} apps", entries.len());
+    Ok(())
+}
+
 async fn cmd_info(provider: &UsbmuxdProvider) -> Result<()> {
     let mut afc = connect_afc(provider).await?;
     let info = afc.get_device_info().await?;
@@ -490,7 +565,7 @@ async fn cmd_push(
 
     let dest = match dest {
         Some(d) => d.clone(),
-        None if app.is_some() => format!("/{}", filename),
+        None if app.is_some() => format!("/Documents/{}", filename),
         None => format!("/Downloads/{}", filename),
     };
 
@@ -575,6 +650,9 @@ async fn main() -> Result<()> {
         }
         Command::Info => {
             cmd_info(&provider).await
+        }
+        Command::Apps { filter, search } => {
+            cmd_apps(&provider, filter, search.as_deref()).await
         }
         Command::Du { path, depth } => {
             cmd_du(&provider, path, *depth).await
